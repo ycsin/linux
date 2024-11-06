@@ -8,6 +8,8 @@
 
 #include <linux/jump_label.h>
 #include <linux/sched/task_stack.h>
+#include <soc/andes/csr.h>
+#include <asm/vector.h>
 #include <asm/hwcap.h>
 #include <asm/processor.h>
 #include <asm/ptrace.h>
@@ -46,7 +48,7 @@ static inline void fstate_restore(struct task_struct *task,
 	}
 }
 
-static inline void __switch_to_aux(struct task_struct *prev,
+static inline void __switch_to_fpu(struct task_struct *prev,
 				   struct task_struct *next)
 {
 	struct pt_regs *regs;
@@ -65,8 +67,37 @@ static __always_inline bool has_fpu(void)
 static __always_inline bool has_fpu(void) { return false; }
 #define fstate_save(task, regs) do { } while (0)
 #define fstate_restore(task, regs) do { } while (0)
-#define __switch_to_aux(__prev, __next) do { } while (0)
-#endif
+#define __switch_to_fpu(__prev, __next) do { } while (0)
+#endif /* CONFIG_FPU */
+
+#ifdef CONFIG_DSP
+static inline void dspstate_save(struct task_struct *task)
+{
+	task->thread.dspstate.ucode = csr_read(CSR_UCODE);
+}
+
+static inline void dspstate_restore(struct task_struct *task)
+{
+	csr_write(CSR_UCODE, task->thread.dspstate.ucode);
+}
+
+static inline void __switch_to_dsp(struct task_struct *prev,
+				   struct task_struct *next)
+{
+	dspstate_save(prev);
+	dspstate_restore(next);
+}
+
+static __always_inline bool has_dsp(void)
+{
+	return static_branch_likely(&riscv_isa_ext_keys[ANDES_ISA_EXT_KEY_DSP]);
+}
+#else
+static __always_inline bool has_dsp(void) { return false; }
+#define dspstate_save(task) do { } while (0)
+#define dspstate_restore(task) do { } while (0)
+#define __switch_to_dsp(__prev, __next) do { } while (0)
+#endif /* CONFIG_DSP */
 
 extern struct task_struct *__switch_to(struct task_struct *,
 				       struct task_struct *);
@@ -75,8 +106,12 @@ extern struct task_struct *__switch_to(struct task_struct *,
 do {							\
 	struct task_struct *__prev = (prev);		\
 	struct task_struct *__next = (next);		\
-	if (has_fpu())					\
-		__switch_to_aux(__prev, __next);	\
+	if (has_fpu())			\
+		__switch_to_fpu(__prev, __next);	\
+	if (has_dsp())			\
+		__switch_to_dsp(__prev, __next);	\
+	if (has_vector())					\
+		__switch_to_vector(__prev, __next);	\
 	((last) = __switch_to(__prev, __next));		\
 } while (0)
 

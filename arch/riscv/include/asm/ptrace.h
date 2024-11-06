@@ -49,6 +49,11 @@ struct pt_regs {
 	unsigned long status;
 	unsigned long badaddr;
 	unsigned long cause;
+
+#ifdef CONFIG_PLAT_AE350
+	/* Andes supervisor detailed trap cause */
+	unsigned long sdcause;
+#endif
 	/* a0 value before the syscall */
 	unsigned long orig_a0;
 };
@@ -58,6 +63,9 @@ struct pt_regs {
 #else
 #define REG_FMT "%08lx"
 #endif
+
+/* Andes use trigger module to implement the ptrace single step. */
+#define arch_has_single_step() (1)
 
 #define user_mode(regs) (((regs)->status & SR_PP) == 0)
 

@@ -150,6 +150,12 @@ struct pt_alloc_ops {
 extern struct pt_alloc_ops pt_ops __initdata;
 
 #ifdef CONFIG_MMU
+#ifdef CONFIG_PLAT_AE350
+/* Noncacheable page prot for Andes MSB */
+extern phys_addr_t andes_pa_msb;
+#define _PAGE_NONCACHEABLE      ((!!andes_pa_msb) << 31)
+#endif /* CONFIG_PLAT_AE350 */
+
 /* Number of PGD entries that a user-mode program can use */
 #define USER_PTRS_PER_PGD   (TASK_SIZE / PGDIR_SIZE)
 
@@ -225,7 +231,10 @@ static inline int pmd_leaf(pmd_t pmd)
 
 static inline void set_pmd(pmd_t *pmdp, pmd_t pmd)
 {
+	preempt_disable();
 	*pmdp = pmd;
+	ALT_LEGACY_MMU_FLUSH_TLB();
+	preempt_enable();
 }
 
 static inline void pmd_clear(pmd_t *pmdp)
@@ -267,10 +276,47 @@ static inline pte_t pud_pte(pud_t pud)
 	return __pte(pud_val(pud));
 }
 
+#ifdef CONFIG_RISCV_ISA_SVNAPOT
+
+static __always_inline bool has_svnapot(void)
+{
+	return static_branch_likely(&riscv_isa_ext_keys[RISCV_ISA_EXT_KEY_SVNAPOT]);
+}
+
+static inline unsigned long pte_napot(pte_t pte)
+{
+	return pte_val(pte) & _PAGE_NAPOT;
+}
+
+static inline pte_t pte_mknapot(pte_t pte, unsigned int order)
+{
+	int pos = order - 1 + _PAGE_PFN_SHIFT;
+	unsigned long napot_bit = BIT(pos);
+	unsigned long napot_mask = ~GENMASK(pos, _PAGE_PFN_SHIFT);
+
+	return __pte((pte_val(pte) & napot_mask) | napot_bit | _PAGE_NAPOT);
+}
+
+#else
+
+static __always_inline bool has_svnapot(void) { return false; }
+
+static inline unsigned long pte_napot(pte_t pte)
+{
+	return 0;
+}
+
+#endif /* CONFIG_RISCV_ISA_SVNAPOT */
+
 /* Yields the page frame number (PFN) of a page table entry */
 static inline unsigned long pte_pfn(pte_t pte)
 {
-	return __page_val_to_pfn(pte_val(pte));
+	unsigned long res  = __page_val_to_pfn(pte_val(pte));
+
+	if (has_svnapot() && pte_napot(pte))
+		res = res & (res - 1UL);
+
+	return res;
 }
 
 #define pte_page(x)     pfn_to_page(pte_pfn(x))
@@ -282,7 +328,19 @@ static inline pte_t pfn_pte(unsigned long pfn, pgprot_t prot)
 
 	ALT_THEAD_PMA(prot_val);
 
+#ifdef CONFIG_PLAT_AE350
+	/*
+	 * When PPMA is on and activated: pa_msb == 0;
+	 *                     Otherwise: pa_msb != 0;
+	 */
+	if (andes_pa_msb && (prot_val & _PAGE_NONCACHEABLE))
+		return __pte(((pfn | andes_pa_msb) << _PAGE_PFN_SHIFT)
+				| (prot_val  & ~_PAGE_NONCACHEABLE));
+	else
+		return __pte((pfn << _PAGE_PFN_SHIFT) | prot_val);
+#else
 	return __pte((pfn << _PAGE_PFN_SHIFT) | prot_val);
+#endif /* !CONFIG_PLAT_AE350 */
 }
 
 #define mk_pte(page, prot)       pfn_pte(page_to_pfn(page), prot)
@@ -442,7 +500,10 @@ static inline int pte_same(pte_t pte_a, pte_t pte_b)
  */
 static inline void set_pte(pte_t *ptep, pte_t pteval)
 {
+	preempt_disable();
 	*ptep = pteval;
+	ALT_LEGACY_MMU_FLUSH_TLB();
+	preempt_enable();
 }
 
 void flush_icache_pte(pte_t pte);
@@ -540,6 +601,9 @@ static inline pgprot_t pgprot_noncached(pgprot_t _prot)
 
 	prot &= ~_PAGE_MTMASK;
 	prot |= _PAGE_IO;
+#ifdef CONFIG_PLAT_AE350
+	prot |= _PAGE_NONCACHEABLE;
+#endif
 
 	return __pgprot(prot);
 }
@@ -551,7 +615,9 @@ static inline pgprot_t pgprot_writecombine(pgprot_t _prot)
 
 	prot &= ~_PAGE_MTMASK;
 	prot |= _PAGE_NOCACHE;
-
+#ifdef CONFIG_PLAT_AE350
+	prot |= _PAGE_NONCACHEABLE;
+#endif
 	return __pgprot(prot);
 }
 
@@ -818,7 +884,6 @@ extern uintptr_t _dtb_early_pa;
 #define dtb_early_pa	_dtb_early_pa
 #endif /* CONFIG_XIP_KERNEL */
 extern u64 satp_mode;
-extern bool pgtable_l4_enabled;
 
 void paging_init(void);
 void misc_mem_init(void);

@@ -19,7 +19,10 @@
 #include <linux/of.h>
 #include <linux/cpu_pm.h>
 #include <linux/sched/clock.h>
+#include <soc/andes/sbi.h>
+#include <soc/andes/csr.h>
 
+#include <asm/errata_list.h>
 #include <asm/sbi.h>
 #include <asm/hwcap.h>
 
@@ -47,7 +50,10 @@ static const struct attribute_group *riscv_pmu_attr_groups[] = {
  * per_cpu in case of harts with different pmu counters
  */
 static union sbi_pmu_ctr_info *pmu_ctr_list;
+static bool riscv_pmu_use_irq;
+static unsigned int riscv_pmu_irq_num;
 static unsigned int riscv_pmu_irq;
+static DEFINE_STATIC_KEY_FALSE_RO(andes_hpm);
 
 struct sbi_pmu_event_data {
 	union {
@@ -382,11 +388,8 @@ static int pmu_sbi_event_map(struct perf_event *event, u64 *econfig)
 		bSoftware = config >> 63;
 		raw_config_val = config & RISCV_PMU_RAW_EVENT_MASK;
 		if (bSoftware) {
-			if (raw_config_val < SBI_PMU_FW_MAX)
-				ret = (raw_config_val & 0xFFFF) |
-				      (SBI_PMU_EVENT_TYPE_FW << 16);
-			else
-				return -EINVAL;
+			ret = (raw_config_val & 0xFFFF) |
+				(SBI_PMU_EVENT_TYPE_FW << 16);
 		} else {
 			ret = RISCV_PMU_RAW_EVENT_IDX;
 			*econfig = raw_config_val;
@@ -580,7 +583,10 @@ static irqreturn_t pmu_sbi_ovf_handler(int irq, void *dev)
 	fidx = find_first_bit(cpu_hw_evt->used_hw_ctrs, RISCV_MAX_COUNTERS);
 	event = cpu_hw_evt->events[fidx];
 	if (!event) {
-		csr_clear(CSR_SIP, SIP_LCOFIP);
+		if (static_branch_unlikely(&andes_hpm))
+			csr_clear(CSR_SLIP, BIT(riscv_pmu_irq_num));
+		else
+			csr_clear(CSR_SIP, BIT(riscv_pmu_irq_num));
 		return IRQ_NONE;
 	}
 
@@ -588,13 +594,16 @@ static irqreturn_t pmu_sbi_ovf_handler(int irq, void *dev)
 	pmu_sbi_stop_hw_ctrs(pmu);
 
 	/* Overflow status register should only be read after counter are stopped */
-	overflow = csr_read(CSR_SSCOUNTOVF);
+	ALT_SBI_PMU_OVERFLOW(overflow);
 
 	/*
 	 * Overflow interrupt pending bit should only be cleared after stopping
 	 * all the counters to avoid any race condition.
 	 */
-	csr_clear(CSR_SIP, SIP_LCOFIP);
+	if (static_branch_unlikely(&andes_hpm))
+		csr_clear(CSR_SLIP, BIT(riscv_pmu_irq_num));
+	else
+		csr_clear(CSR_SIP, BIT(riscv_pmu_irq_num));
 
 	/* No overflow bit is set */
 	if (!overflow)
@@ -661,10 +670,15 @@ static int pmu_sbi_starting_cpu(unsigned int cpu, struct hlist_node *node)
 	/* Stop all the counters so that they can be enabled from perf */
 	pmu_sbi_stop_all(pmu);
 
-	if (riscv_isa_extension_available(NULL, SSCOFPMF)) {
+	if (riscv_pmu_use_irq) {
 		cpu_hw_evt->irq = riscv_pmu_irq;
-		csr_clear(CSR_IP, BIT(RV_IRQ_PMU));
-		csr_set(CSR_IE, BIT(RV_IRQ_PMU));
+		if (static_branch_unlikely(&andes_hpm)) {
+			csr_clear(CSR_SLIP, BIT(riscv_pmu_irq_num));
+			csr_set(CSR_SLIE, BIT(riscv_pmu_irq_num));
+		} else {
+			csr_clear(CSR_IP, BIT(riscv_pmu_irq_num));
+			csr_set(CSR_IE, BIT(riscv_pmu_irq_num));
+		}
 		enable_percpu_irq(riscv_pmu_irq, IRQ_TYPE_NONE);
 	}
 
@@ -673,9 +687,12 @@ static int pmu_sbi_starting_cpu(unsigned int cpu, struct hlist_node *node)
 
 static int pmu_sbi_dying_cpu(unsigned int cpu, struct hlist_node *node)
 {
-	if (riscv_isa_extension_available(NULL, SSCOFPMF)) {
+	if (riscv_pmu_use_irq) {
 		disable_percpu_irq(riscv_pmu_irq);
-		csr_clear(CSR_IE, BIT(RV_IRQ_PMU));
+		if (static_branch_unlikely(&andes_hpm))
+			csr_clear(CSR_SLIE, BIT(riscv_pmu_irq_num));
+		else
+			csr_clear(CSR_IE, BIT(riscv_pmu_irq_num));
 	}
 
 	/* Disable all counters access for user mode now */
@@ -690,8 +707,30 @@ static int pmu_sbi_setup_irqs(struct riscv_pmu *pmu, struct platform_device *pde
 	struct cpu_hw_events __percpu *hw_events = pmu->hw_events;
 	struct device_node *cpu, *child;
 	struct irq_domain *domain = NULL;
+	struct sbiret result;
 
-	if (!riscv_isa_extension_available(NULL, SSCOFPMF))
+	if (riscv_isa_extension_available(NULL, SSCOFPMF)) {
+		riscv_pmu_irq_num = RV_IRQ_PMU;
+		riscv_pmu_use_irq = true;
+	} else if (IS_ENABLED(CONFIG_ERRATA_THEAD_PMU) &&
+		   riscv_cached_mvendorid(0) == THEAD_VENDOR_ID &&
+		   riscv_cached_marchid(0) == 0 &&
+		   riscv_cached_mimpid(0) == 0) {
+		riscv_pmu_irq_num = THEAD_C9XX_RV_IRQ_PMU;
+		riscv_pmu_use_irq = true;
+	} else if (IS_ENABLED(CONFIG_ERRATA_ANDES_HPM) &&
+		   riscv_cached_mvendorid(0) == ANDES_VENDOR_ID) {
+
+		result = sbi_ecall(SBI_EXT_ANDES, SBI_EXT_ANDES_HPM, 0,0,0,0,0,0);
+		if (result.value) {
+			riscv_pmu_irq_num = ANDES_RV_IRQ_HPM;
+			riscv_pmu_use_irq = true;
+			static_branch_enable(&andes_hpm);
+			pr_info("Andes HPM is available\n");
+		}
+	}
+
+	if (!riscv_pmu_use_irq)
 		return -EOPNOTSUPP;
 
 	for_each_of_cpu_node(cpu) {
@@ -713,7 +752,7 @@ static int pmu_sbi_setup_irqs(struct riscv_pmu *pmu, struct platform_device *pde
 		return -ENODEV;
 	}
 
-	riscv_pmu_irq = irq_create_mapping(domain, RV_IRQ_PMU);
+	riscv_pmu_irq = irq_create_mapping(domain, riscv_pmu_irq_num);
 	if (!riscv_pmu_irq) {
 		pr_err("Failed to map PMU interrupt for node\n");
 		return -ENODEV;

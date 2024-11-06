@@ -14,6 +14,8 @@
 #include <asm/asm-offsets.h>
 #include <asm/errata_list.h>
 
+#include <soc/andes/csr.h>
+
 #if !IS_ENABLED(CONFIG_PREEMPTION)
 .set resume_kernel, restore_all
 #endif
@@ -77,10 +79,10 @@ _save_context:
 	 * Disable user-mode memory access as it should only be set in the
 	 * actual user copy routines.
 	 *
-	 * Disable the FPU to detect illegal usage of floating point in kernel
-	 * space.
+	 * Disable the FPU/Vector to detect illegal usage of floating point
+	 * or vector in kernel space.
 	 */
-	li t0, SR_SUM | SR_FS
+	li t0, SR_SUM | SR_FS_VS
 
 	REG_L s0, TASK_TI_USER_SP(tp)
 	csrrc s1, CSR_STATUS, t0
@@ -88,12 +90,18 @@ _save_context:
 	csrr s3, CSR_TVAL
 	csrr s4, CSR_CAUSE
 	csrr s5, CSR_SCRATCH
+#ifdef CONFIG_PLAT_AE350
+	csrr s6, CSR_SDCAUSE
+#endif
 	REG_S s0, PT_SP(sp)
 	REG_S s1, PT_STATUS(sp)
 	REG_S s2, PT_EPC(sp)
 	REG_S s3, PT_BADADDR(sp)
 	REG_S s4, PT_CAUSE(sp)
 	REG_S s5, PT_TP(sp)
+#ifdef CONFIG_PLAT_AE350
+	REG_S s6, PT_SDCAUSE(sp)
+#endif
 
 	/*
 	 * Set the scratch register to 0, so that if a recursive exception
@@ -272,6 +280,12 @@ resume_userspace:
 	call user_enter_callable
 #endif
 
+.global bypass_singlestep
+bypass_singlestep:
+	j 1f
+	/* Set trigger module for single step */
+	call do_singlestep
+1:
 	/* Save unwound kernel stack pointer in thread_info */
 	addi s0, sp, PT_SIZE_ON_STACK
 	REG_S s0, TASK_TI_KERNEL_SP(tp)
